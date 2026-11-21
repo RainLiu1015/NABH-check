@@ -1,7 +1,9 @@
 """Offline safety/decision tests: python -m unittest -v test_verify."""
 import unittest
+import json
 from datetime import date
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 import verify
 
@@ -30,6 +32,55 @@ def fixture():
 
 
 class VerificationTests(unittest.TestCase):
+    @patch.dict("os.environ", {"ARK_API_KEY": "test", "ARK_MODEL": "doubao-seed-2-1-pro-260915",
+                              "ARK_TIMEOUT_SECONDS": "180", "ARK_THINKING": "disabled",
+                              "ARK_MAX_OUTPUT_TOKENS": "4096"})
+    def test_ark_payload_disables_thinking_and_preserves_evidence(self):
+        c, a = fixture()
+        c["pdf"]["sha256"] = "hash-not-needed-by-model"
+        opener = MagicMock()
+        response = opener.open.return_value.__enter__.return_value
+        response.read.return_value = json.dumps({
+            "status": "completed", "output": [{"type": "message", "content": [
+                {"type": "output_text", "text": json.dumps({"assessments": [a]})}
+            ]}]
+        }).encode()
+        with patch.object(verify, "build_opener", return_value=opener):
+            self.assertEqual(verify.ark_assess(c["name"], c["address"], [c]), [a])
+        request = opener.open.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(opener.open.call_args.kwargs["timeout"], 180)
+        self.assertEqual(payload["thinking"], {"type": "disabled"})
+        self.assertEqual(payload["max_output_tokens"], 4096)
+        evidence = json.loads(payload["input"][1]["content"])["candidates"][0]
+        self.assertEqual(evidence["pdf"]["text"], c["pdf"]["text"])
+        self.assertNotIn("sha256", evidence["pdf"])
+        self.assertNotIn("pdf_url", evidence)
+
+    @patch.dict("os.environ", {"ARK_API_KEY": "test", "ARK_MODEL": "test",
+                              "ARK_TIMEOUT_SECONDS": "300", "ARK_THINKING": "disabled"})
+    def test_ark_direct_and_wrapped_timeouts_are_actionable_without_retry(self):
+        c, _ = fixture()
+        for error in (TimeoutError("read timed out"), URLError(TimeoutError("read timed out"))):
+            opener = MagicMock()
+            opener.open.side_effect = error
+            with patch.object(verify, "build_opener", return_value=opener):
+                with self.assertRaisesRegex(verify.SourceError, "socket timeout 300s"):
+                    verify.ark_assess(c["name"], c["address"], [c])
+            opener.open.assert_called_once()
+
+    @patch.dict("os.environ", {"ARK_API_KEY": "test", "ARK_MODEL": "test",
+                              "ARK_TIMEOUT_SECONDS": "180", "ARK_THINKING": "disabled"})
+    def test_ark_incomplete_output_is_not_accepted(self):
+        c, _ = fixture()
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value.read.return_value = json.dumps({
+            "status": "incomplete", "incomplete_details": {"reason": "max_output_tokens"}
+        }).encode()
+        with patch.object(verify, "build_opener", return_value=opener):
+            with self.assertRaisesRegex(verify.SourceError, "increase ARK_MAX_OUTPUT_TOKENS"):
+                verify.ark_assess(c["name"], c["address"], [c])
+
     def judge(self, c, a, today=date(2026, 11, 21), address=None):
         return verify.judge(c, a, address or c["address"], today)
 

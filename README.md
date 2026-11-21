@@ -63,6 +63,31 @@ python verify.py \
 结果由实时官网记录和模型输出决定，不保证示例每次均为 `verified`。
 一次完整验证会执行多次网络请求，可能需要数分钟。
 
+### 方舟响应超时排查
+
+默认使用 `thinking: disabled`、`max_output_tokens: 4096`，方舟 socket 超时为 180 秒。
+这适用于 `doubao-seed-2-1-pro-260915` 的证据提取 Demo；原先未设置 thinking 的请求
+可能启用深度思考，延长等待时间。网络延迟、服务排队也可能导致超时。
+此超时是网络 socket 等待时间，不是整个任务的总时限。
+
+```bash
+export ARK_MODEL='doubao-seed-2-1-pro-260915'
+export ARK_THINKING=disabled
+export ARK_TIMEOUT_SECONDS=180
+export ARK_MAX_OUTPUT_TOKENS=4096
+
+python verify.py \
+  --name 'Accord Hospital' \
+  --address 'Sant Nagar, Sector No.4, Plot No.1/1, Moshi Pradhikaran, Pune, Maharashtra 412105' \
+  --verbose
+```
+
+`--verbose` 将阶段日志写到 stderr，不影响 stdout 的 JSON。
+若仍超时，可将 `ARK_TIMEOUT_SECONDS` 提高到 300（最大 600），并检查运行环境到
+`ark.cn-beijing.volces.com` 的网络连接。脚本不自动重试模型请求，避免重复发起收费调用。
+若返回 HTTP 401/403/404，应检查 Key、模型访问权限和模型 ID，而不是继续增大超时。
+需要深度思考时可设 `ARK_THINKING=enabled`，并相应增加超时和输出 token 预算。
+
 ## 验证流程
 
 ```text

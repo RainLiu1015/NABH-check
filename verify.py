@@ -10,12 +10,13 @@ import argparse
 import hashlib
 import io
 import json
+import logging
 import os
 import re
 import sys
 from datetime import date, datetime, timezone
 from difflib import SequenceMatcher
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
@@ -33,6 +34,7 @@ SOURCE_HOSTS = {
 }
 TIMEOUT = 30
 MAX_BYTES = 12 * 1024 * 1024
+LOGGER = logging.getLogger("nabh_check")
 
 
 class SourceError(Exception):
@@ -171,13 +173,27 @@ def ark_assess(name: str, address: str, candidates: list[dict]) -> list[dict]:
     model = os.environ.get("ARK_MODEL")
     if not api_key or not model:
         raise ValueError("Set ARK_API_KEY and ARK_MODEL (Responses-capable model/endpoint ID)")
+    timeout = int(os.environ.get("ARK_TIMEOUT_SECONDS", "180"))
+    max_tokens = int(os.environ.get("ARK_MAX_OUTPUT_TOKENS", "4096"))
+    thinking = os.environ.get("ARK_THINKING", "disabled")
+    if not 1 <= timeout <= 600 or not 512 <= max_tokens <= 32768:
+        raise ValueError("ARK_TIMEOUT_SECONDS must be 1-600; ARK_MAX_OUTPUT_TOKENS must be 512-32768")
+    if thinking not in ("disabled", "enabled"):
+        raise ValueError("ARK_THINKING must be disabled or enabled")
+    # Transport metadata, signed URLs and hashes are not identity evidence.
+    evidence = [{
+        "candidate_id": c["candidate_id"], "name": c["name"], "address": c["address"],
+        "cert_no": c["cert_no"], "directory_status": c["directory_status"],
+        "pdf": {"text": c["pdf"]["text"], "error": c["pdf"]["error"]},
+    } for c in candidates]
     payload = {
         "model": model, "stream": False,
+        "thinking": {"type": thinking}, "max_output_tokens": max_tokens,
         "input": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": json.dumps({
                 "facility": {"name": name, "address": address},
-                "candidates": candidates,
+                "candidates": evidence,
             }, ensure_ascii=False)},
         ],
     }
@@ -188,14 +204,27 @@ def ark_assess(name: str, address: str, candidates: list[dict]) -> list[dict]:
     class NoRedirect(HTTPRedirectHandler):
         def redirect_request(self, *args, **kwargs):
             return None
+    LOGGER.info("Ark model=%s thinking=%s timeout=%ss; waiting for assessment", model, thinking, timeout)
     try:
-        with build_opener(NoRedirect()).open(req, timeout=90) as response:
+        with build_opener(NoRedirect()).open(req, timeout=timeout) as response:
             raw = response.read(2 * 1024 * 1024)
     except HTTPError as exc:
         raise SourceError(f"Ark returned HTTP {exc.code}; check model/service access") from exc
+    except (TimeoutError, URLError) as exc:
+        if isinstance(exc, TimeoutError) or isinstance(getattr(exc, "reason", None), TimeoutError):
+            raise SourceError(
+                f"Ark request timed out (socket timeout {timeout}s, model={model}, thinking={thinking}). "
+                "Check connectivity to ark.cn-beijing.volces.com; keep ARK_THINKING=disabled "
+                "or increase ARK_TIMEOUT_SECONDS (up to 600). No automatic retry was sent."
+            ) from exc
+        raise SourceError(f"Ark network request failed: {exc.reason}") from exc
     response = json.loads(raw)
     if response.get("status") not in (None, "completed"):
-        raise SourceError("Ark response was not completed")
+        raise SourceError(
+            f"Ark response status={response.get('status')}; "
+            f"incomplete_details={response.get('incomplete_details')}. "
+            "If the output token limit was reached, increase ARK_MAX_OUTPUT_TOKENS."
+        )
     texts = [part["text"] for item in response.get("output", [])
              if item.get("type") == "message" for part in item.get("content", [])
              if part.get("type") == "output_text"]
@@ -294,6 +323,7 @@ def verify_facility(name: str, address: str, *, directory_only: bool = False,
         result.update(status="configuration_error", error="Set ARK_API_KEY and ARK_MODEL")
         return result
     try:
+        LOGGER.info("Querying live NABH directory for %s", name.strip())
         candidates, truncated = search_directory(name.strip())
     except Exception as exc:
         result.update(status="source_unavailable", error=f"{type(exc).__name__}: {exc}")
@@ -317,7 +347,10 @@ def verify_facility(name: str, address: str, *, directory_only: bool = False,
         result["status"] = "not_attempted"
         return result
     for candidate in candidates:
+        LOGGER.info("Reading PDF for %s (%s)", candidate["name"], candidate["cert_no"])
         candidate["pdf"] = load_pdf(candidate)
+        if candidate["pdf"]["error"]:
+            LOGGER.info("PDF unavailable: %s", candidate["pdf"]["error"])
     try:
         assessments = ark_assess(name, address, candidates)
         by_id = {a["candidate_id"]: a for a in assessments}
@@ -351,7 +384,10 @@ def main() -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--address", required=True)
     parser.add_argument("--directory-only", action="store_true", help="Live source smoke test; no Ark call or verification")
+    parser.add_argument("--verbose", action="store_true", help="Print progress to stderr; stdout remains JSON")
     args = parser.parse_args()
+    if args.verbose:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s", datefmt="%H:%M:%S")
     try:
         result = verify_facility(args.name, args.address, directory_only=args.directory_only)
     except ValueError as exc:
