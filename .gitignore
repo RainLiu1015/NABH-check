@@ -1,18 +1,7 @@
-# Uncompressed data exports — committed as .csv.gz instead (see data/README.md)
-data/*.csv
-
-# Node / AppKit
-node_modules/
-dist/
-build/
-.next/
+.venv/
 .env
-.env.local
-.venv-nabh/
-*.log
-
-# OS / editor
+.env.*
+!.env.example
+__pycache__/
+*.pyc
 .DS_Store
-Thumbs.db
-.vscode/
-.idea/

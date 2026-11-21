@@ -1,4 +1,4 @@
-"""Offline safety/decision tests: python -m unittest discover -s scripts/nabh_agent."""
+"""Offline safety/decision tests: python -m unittest -v test_verify."""
 import unittest
 from datetime import date
 from unittest.mock import patch
